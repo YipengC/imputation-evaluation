@@ -1,0 +1,652 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# Imports and options
+options(scipen = 999) # Avoids scientific notation when printing.
+library(topGO)
+
+source('imputation_classes.R')
+source('data_preprocessing.R')
+source('imputation_simulation_evaluation.R')
+source('visualisation.R')
+source('differential_expression.R')
+source('data_classes.R')
+source('combined_imputation.R')
+
+library(parallel)
+library(mice)
+library(naniar)
+library(topGO)
+library(ggpubr)
+
+random.seed <- 42
+set.seed(random.seed) # Remove this line if using in practice
+```
+
+```{r}
+# Load and preprocess SWATH data
+
+loaded.data <- read.table(file = 'manchester_mice_proteins_preprocessed.txt', header = TRUE, sep = '\t')
+data.column.names <- colnames(loaded.data)[-length(colnames(loaded.data))]
+data.numerical.columns <- loaded.data[data.column.names]
+
+# Convert missing values to 0
+data.numerical.columns <- NAs.to.zeros(data.numerical.columns)
+
+# Since we are simulating missing values and using a log transform, the 0s that exist already in the dataset need to be removed.
+rows.without.zero <- apply(data.numerical.columns, 1, function(row) all(row != 0))
+loaded.data <- loaded.data[rows.without.zero,]
+data.numerical.columns <- data.numerical.columns[rows.without.zero,]
+
+data.numerical.columns.non.logged <- data.numerical.columns
+
+# Take log of each column to obtain a normal distribution per column (protein abundances follow a log normal distribution)
+data.numerical.columns <- log2(data.numerical.columns)
+
+
+# First shuffle data rows to avoid bias
+shuffle.indexes <- sample(nrow(data.numerical.columns))
+data.numerical.columns <- data.numerical.columns[shuffle.indexes,]
+rownames(data.numerical.columns) <- NULL
+
+# Create a copy of data.numerical.columns for the ground truth dataset
+ground.truth.df <- data.numerical.columns
+
+# To use this in practice, the original data with all the columns must also be shuffled with the same indexes to preserve row (protein) information.
+loaded.data <- loaded.data[shuffle.indexes,]
+rownames(loaded.data) <- NULL
+data.numerical.columns.non.logged <- data.numerical.columns.non.logged[shuffle.indexes,]
+rownames(data.numerical.columns.non.logged) <- NULL
+```
+
+```{r}
+# Perform median shift
+median.shift.result <- subtract.median(data.numerical.columns)
+data.numerical.columns <- median.shift.result$df
+```
+
+```{r}
+# Function for plotting distributions of log intensity histograms
+plot.log.intensity <- function(log.intensity.df, column.name, title = '', xlimit = 30, ylimit = 450) {
+  log.intensity.plot <- ggplot(data = log.intensity.df, mapping = aes_string(column.name)) + geom_histogram(binwidth = 0.5) + xlab(paste(column.name, 'log intensity', sep = ' ')) +
+    ggtitle(title) + coord_cartesian(xlim = c(-xlimit, xlimit), ylim = c(0, ylimit))
+  print(log.intensity.plot)
+}
+```
+
+```{r}
+sapply(colnames(data.numerical.columns), function(column.name) plot.log.intensity(data.numerical.columns, column.name, 'Log2 Intensity Distribution Before Ampute'))
+```
+```{r}
+# Plot scatter plots using the first column for each condition to show distribution of high and low values
+plot(x = data.numerical.columns$KO.PMCAI.MI_1, y = data.numerical.columns$KO.PMCAI.Sham_1)
+plot(x = data.numerical.columns$KO.PMCAI.MI_1, y = data.numerical.columns$WT.MI_1)
+plot(x = data.numerical.columns$KO.PMCAI.MI_1, y = data.numerical.columns$WT.Sham_1)
+plot(x = data.numerical.columns$KO.PMCAI.Sham_1, y = data.numerical.columns$WT.MI_1)
+plot(x = data.numerical.columns$KO.PMCAI.Sham_1, y = data.numerical.columns$WT.Sham_1)
+plot(x = data.numerical.columns$WT.MI_1, y = data.numerical.columns$WT.Sham_1)
+```
+```{r}
+weighted.patterned.ampute <- function(df, data.column.names) {
+
+  number.of.random.patterns <- 16
+  ampute.patterns.random <- matrix(rbinom(number.of.random.patterns * 15, 1, 0.5), number.of.random.patterns, 15)
+  
+  ampute.patterns <- ampute.patterns.random 
+  print('ampute.patterns')
+  print(ampute.patterns)
+  print('nrow(ampute.patterns)')
+  print(nrow(ampute.patterns))
+  ampute.weights <- ampute.default.weights(ampute.patterns, 'MNAR')
+  ampute.types <- rep('LEFT', times = nrow(ampute.patterns))
+  ampute.freqs <- ampute.default.freq(ampute.patterns)
+  
+  ampute.result <- ampute(df[, data.column.names], patterns = ampute.patterns, freq = ampute.freqs, weights = ampute.weights, cont = TRUE, type = ampute.types, prop = 0.95)
+  ampute.result
+}
+```
+
+```{r}
+simulate.missing.data <- function(df, column.names) {
+  # Add data with amputed pattern
+  weighted.patterned.ampute.result <- weighted.patterned.ampute(df = df, data.column.names = column.names)
+  
+  wpa.data.with.missing.values <- weighted.patterned.ampute.result$amp
+  
+  wpa.simulated.missing.values.mask <- get.missing.data.mask(df = wpa.data.with.missing.values, data.column.names = column.names)
+  
+  list(data.with.missing.values = wpa.data.with.missing.values, simulated.missing.values.mask = wpa.simulated.missing.values.mask,
+       wpa.data.with.missing.values = wpa.data.with.missing.values,
+       wpa.simulated.missing.values.mask = wpa.simulated.missing.values.mask,
+       wpa.result = weighted.patterned.ampute.result)
+}
+```
+
+```{r}
+# Apply amputation and visualise distributions afterwards
+simulate.missing.data.result <- simulate.missing.data(df = data.numerical.columns, column.names = data.column.names)
+data.with.missing.values <- simulate.missing.data.result$data.with.missing.values
+simulated.missing.values.mask <- simulate.missing.data.result$simulated.missing.values.mask
+```
+
+```{r}
+# Investigate generated missing data
+bwplot(simulate.missing.data.result$wpa.result, descriptives = TRUE)
+```
+```{r}
+# Test proportion of complete rows left after missing data simulation
+complete.rows <- apply(data.with.missing.values, 1, function(row) all(!is.na(row)))
+sum(complete.rows)
+
+# Show missingness numbers in dataframe
+md.pattern(data.with.missing.values)
+```
+
+```{r}
+# Remove completely empty rows from all relevant dataframes as a result of amputation
+rows.with.data <- apply(data.with.missing.values, 1, function(row) sum(is.na(row)) < length(row) - 3)
+
+data.with.missing.values <- data.with.missing.values[rows.with.data,]
+row.names(data.with.missing.values) <- NULL
+
+simulated.missing.values.mask <- simulated.missing.values.mask[rows.with.data,]
+row.names(simulated.missing.values.mask) <- NULL
+
+loaded.data <- loaded.data[rows.with.data,]
+row.names(loaded.data) <- NULL
+
+data.numerical.columns <- data.numerical.columns[rows.with.data,]
+row.names(data.numerical.columns) <- NULL
+
+data.numerical.columns.non.logged <- data.numerical.columns.non.logged[rows.with.data,]
+row.names(data.numerical.columns.non.logged) <- NULL
+
+ground.truth.df <- ground.truth.df[rows.with.data,]
+row.names(ground.truth.df) <- NULL
+
+sapply(colnames(data.with.missing.values), function(column.name) plot.log.intensity(data.with.missing.values, column.name, 'Log2 Intensity Distribution After Ampute'))
+```
+```{r}
+# Visualise missing data with UpSet plots and heatmaps
+gg_miss_upset(data.with.missing.values, nsets = n_var_miss(data.with.missing.values), nintersects = 35)
+
+formatted.sample.column.names <- c("KO MI 1", "KO MI 2", "KO MI 3", "KO MI 4", "KO Control 1", "KO Control 2", "KO Control 3", "WT MI 1", "WT MI 2", "WT MI 3", "WT MI 4", "WT Control 1", "WT Control 2", "WT Control 3", "WT Control 4")
+
+data.with.missing.values.formatted.column.names <- data.with.missing.values
+names(data.with.missing.values.formatted.column.names) <- formatted.sample.column.names
+
+missing.data.pattern.heatmap <- vis_miss(data.with.missing.values.formatted.column.names) + ggtitle('B) Missing Data Heatmap') + theme(legend.text = element_text(size = 50), title = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_text(size = 50))
+missing.data.pattern.heatmap
+ggsave('plots/missing_data_pattern_heatmap.pdf', missing.data.pattern.heatmap, width = 20, height = 9)
+ggsave('plots/missing_data_pattern_heatmap.svg', missing.data.pattern.heatmap, width = 20, height = 9)
+ggsave('plots/missing_data_pattern_heatmap.png', missing.data.pattern.heatmap, width = 20, height = 9)
+```
+
+```{r}
+# Set up imputation
+imputation.technique.array <- c(# zero.imputation.technique,
+                                min.det.imputation.technique,
+                                knn.imputation.technique,
+                                random.forest.imputation.technique,
+                                qrilc.imputation.technique)
+
+# Create array of imputed datasets by applying each imputation technique to the loaded dataset
+imputed.datasets <- lapply(imputation.technique.array, function(technique){
+  technique$apply(data.with.missing.values)
+})
+
+# Add combined method
+imputation.technique.names <- sapply(imputation.technique.array, function(technique) {technique$name})
+mar.technique.index <- which(imputation.technique.names == "random forest")
+lod.technique.index <- which(imputation.technique.names == "qrilc")
+
+imputation.technique.array <- append(imputation.technique.array, c(combined.imputation.technique))
+combined.imputation.result <- combined.imputation.technique$apply(data.with.missing.values,
+                                                                  mar.imputed.df = imputed.datasets[[mar.technique.index]],
+                                                                  lod.imputed.df = imputed.datasets[[lod.technique.index]],
+                                                                  condition.factors = factor(c('a','a','a','a',
+                                                                                               'b','b','b',
+                                                                                               'c','c','c','c',
+                                                                                               'd','d','d','d')))
+
+# Add imputation technique names to imputed datasets list
+imputation.technique.names <- sapply(imputation.technique.array, function(technique) {technique$name})
+combined.imputed.df <- combined.imputation.result$imputed.df
+combined.selection.df <- combined.imputation.result$selection.df
+imputed.datasets <- append(imputed.datasets, list(combined.imputed.df))
+
+names(imputed.datasets) <- imputation.technique.names
+  
+```
+```{r}
+# Replace zero imputation with median shifted zero imputation
+imputation.technique.array <- append(imputation.technique.array, c(zero.with.median.shift.imputation.technique))
+zero.imputation.with.median.shift.df <- zero.with.median.shift.imputation.technique$apply(data.with.missing.values, median.shift.result$column.medians)
+imputed.datasets[[zero.with.median.shift.imputation.technique$name]] <- zero.imputation.with.median.shift.df
+imputation.technique.names <- sapply(imputation.technique.array, function(technique) {technique$name})
+```
+
+```{r}
+# Calculate RMSEs
+rmses <- lapply(imputed.datasets, function(imputed.dataset) {
+  calculate.rmse(original.data = data.numerical.columns, imputed.data = imputed.dataset, missing.data.mask = simulated.missing.values.mask)
+})
+rmses
+```
+
+```{r}
+# Capitalise first letter of string
+capitalise.first.letter <- function(input.string) {
+  substr(input.string, 1, 1) <- toupper(substr(input.string, 1, 1))
+  input.string
+}
+```
+
+```{r}
+# Plot imputed dataset distributions
+for (imputation.technique.name in imputation.technique.names) {
+  sapply(colnames(imputed.datasets[[imputation.technique.name]]), function(column.name) plot.log.intensity(imputed.datasets[[imputation.technique.name]], column.name, paste('Log2 Intensity Distribution After Imputation with', capitalise.first.letter(imputation.technique.name), 'Imputation'), ylimit = 2000))
+}
+```
+
+```{r}
+# Create ground truth dataset and perform DE analysis
+ground.truth.dataset <- dataset(imputation.technique = 'none',
+                                df = cbind(Protein = loaded.data$Protein, ground.truth.df),
+                                top.tables = list(),
+                                significant.tables = list(),
+                                significant.proteins = list(),
+                                significant.gene.symbols = list(),
+                                true.positives = list(),
+                                true.negatives = list(),
+                                false.positives = list(),
+                                false.negatives = list(),
+                                sensitivities = list(),
+                                specificities = list(),
+                                precisions = list(),
+                                enrichment.analysis.results = list(),
+                                enrichment.analysis.metrics = list())
+
+ground.truth.de.result <- analyse.de(ground.truth.dataset$df)
+ground.truth.de.contrasts <- ground.truth.de.result$contrasts
+ground.truth.de.fit <- ground.truth.de.result$fit
+
+ground.truth.dataset$top.tables <- lapply(ground.truth.de.contrasts, function(contrast) {
+  print(volcanoplot(ground.truth.de.fit, coef = contrast, main = paste0('Ground Truth: ', contrast)))
+  tt <- topTable(ground.truth.de.fit, coef = contrast, number = Inf, sort.by = 'p')
+  tt$Protein <- rownames(tt)
+  tt
+})
+names(ground.truth.dataset$top.tables) <- ground.truth.de.contrasts
+
+ground.truth.dataset$significant.tables <- lapply(ground.truth.dataset$top.tables, function(top.table) {
+  top.table <- top.table[top.table$adj.P.Val < 0.05,]
+  top.table[abs(top.table$logFC) > log2(2.0),]
+})
+names(ground.truth.dataset$significant.tables) <- ground.truth.de.contrasts
+
+ground.truth.dataset$significant.proteins <- lapply(ground.truth.dataset$significant.tables, function(significant.table) {
+  significant.table$Protein
+})
+names(ground.truth.dataset$significant.proteins) <- ground.truth.de.contrasts
+```
+
+```{r}
+# Create dataset object for each imputation result
+datasets <- list()
+for (i in 1:length(imputation.technique.array)) {
+  datasets[[i]] <- dataset(imputation.technique = imputation.technique.array[[i]]$name,
+                             df = cbind(Protein = loaded.data$Protein, imputed.datasets[[i]]),
+                             top.tables = list(),
+                             significant.tables = list(),
+                             significant.proteins = list(),
+                             significant.gene.symbols = list(),
+                             true.positives = list(),
+                             true.negatives = list(),
+                             false.positives = list(),
+                             false.negatives = list(),
+                             sensitivities = list(),
+                             specificities = list(),
+                             precisions = list(),
+                             enrichment.analysis.results = list(),
+                             enrichment.analysis.metrics = list())
+}
+
+names(datasets) <- imputation.technique.names
+```
+
+```{r}
+# Perform differential expression analysis
+de.results <- lapply(datasets, function(dataset) {
+  analyse.de(dataset$df)
+})
+
+```
+
+```{r}
+# Calculate metrics from differential expression results
+for (i in 1:length(de.results)) {
+  de.contrasts <- de.results[[i]]$contrasts
+    de.fit <- de.results[[i]]$fit
+    
+    datasets[[i]]$top.tables <- lapply(de.contrasts, function(contrast) {
+      print(volcanoplot(de.fit, coef = contrast, main = paste0(imputation.technique.names[[i]], ': ', contrast)))
+      tt <- topTable(de.fit, coef = contrast, number = Inf, sort.by = 'p')
+      tt$Protein <- rownames(tt)
+      tt
+    })
+    names(datasets[[i]]$top.tables) <- de.contrasts
+    
+    datasets[[i]]$significant.tables <- lapply(datasets[[i]]$top.tables, function(top.table) {
+      top.table <- top.table[top.table$adj.P.Val < 0.05,]
+      top.table[abs(top.table$logFC) > log2(2.0),]
+    })
+    names(datasets[[i]]$significant.tables) <- de.contrasts
+    
+    datasets[[i]]$significant.proteins <- lapply(datasets[[i]]$significant.tables, function(significant.table) {
+      significant.table$Protein
+    })
+    names(datasets[[i]]$significant.proteins) <- de.contrasts
+    
+    # Calculate metrics
+    for (contrast.index in 1:length(de.contrasts)) {
+      contrast <- de.contrasts[[contrast.index]]
+      datasets[[i]]$true.positives[[contrast]] <- intersect(datasets[[i]]$significant.proteins[[contrast]],
+                                                               ground.truth.dataset$significant.proteins[[contrast]])
+      datasets[[i]]$false.positives[[contrast]] <- setdiff(datasets[[i]]$significant.proteins[[contrast]],
+                                                                ground.truth.dataset$significant.proteins[[contrast]])
+      
+      negatives <- setdiff(loaded.data$Protein, datasets[[i]]$significant.proteins[[contrast]])
+      ground.truth.negatives <- setdiff(loaded.data$Protein, ground.truth.dataset$significant.proteins[[contrast]])
+      
+      datasets[[i]]$true.negatives[[contrast]] <- intersect(negatives, ground.truth.negatives)
+      datasets[[i]]$false.negatives[[contrast]] <- setdiff(negatives, ground.truth.negatives)
+      
+      tp.count <- length(datasets[[i]]$true.positives[[contrast]])
+      fp.count <- length(datasets[[i]]$false.positives[[contrast]])
+      tn.count <- length(datasets[[i]]$true.negatives[[contrast]])
+      fn.count <- length(datasets[[i]]$false.negatives[[contrast]])
+      
+      datasets[[i]]$sensitivities[[contrast]] <- tp.count / (tp.count + fn.count)
+      datasets[[i]]$specificities[[contrast]] <- tn.count / (tn.count + fp.count)
+      datasets[[i]]$precisions[[contrast]] <- tp.count / (tp.count + fp.count)
+    }
+}
+```
+
+```{r}
+# GO enrichment analysis function
+enrichment.analysis <- function(df, gene.column, de.column) {
+  gene.names <- df[, gene.column]
+  interesting.genes <- df[df[, de.column],][, gene.column]
+  gene.list <- factor(as.integer(gene.names %in% interesting.genes))
+  names(gene.list) <- gene.names
+  print(str(gene.list))
+  
+  go.data <- new('topGOdata', ontology = 'BP', allGenes = gene.list, annot = annFUN.org, mapping = 'org.Mm.eg.db', ID = 'symbol')
+  
+  result.fisher <- runTest(go.data, algorithm = 'classic', statistic = 'fisher')
+  
+  # Show only significant (p < 0.01) GO terms in results table
+  results.table <- GenTable(go.data, classic = result.fisher, topNodes = sum(score(result.fisher) < 0.01))
+  
+  list(go.data = go.data, result.fisher = result.fisher, results.table = results.table)
+}
+
+enrichment.analysis.using.lists <- function(all.genes, interesting.genes) {
+  gene.list <- factor(as.integer(all.genes %in% interesting.genes))
+  names(gene.list) <- all.genes
+  
+  go.data <- new('topGOdata', ontology = 'BP', allGenes = gene.list, annot = annFUN.org, mapping = 'org.Mm.eg.db', ID = 'symbol')
+  
+  result.fisher <- runTest(go.data, algorithm = 'classic', statistic = 'fisher')
+  
+  # Show only significant (p < 0.01) GO terms in results table
+  results.table <- GenTable(go.data, classic = result.fisher, topNodes = sum(score(result.fisher) < 0.01))
+  
+  list(go.data = go.data, result.fisher = result.fisher, results.table = results.table)
+}
+```
+
+```{r}
+uniprot.to.gene.symbols <- read.table('mouse_uniprot_id_and_gene_name_table.csv', header = TRUE, sep = ',')
+uniprot.to.gene.symbols.duplicated.boolean.index <- duplicated(uniprot.to.gene.symbols$uniprot_gn_id)
+uniprot.to.gene.symbols <- uniprot.to.gene.symbols[!uniprot.to.gene.symbols.duplicated.boolean.index,]
+rownames(uniprot.to.gene.symbols) <- NULL
+rownames(uniprot.to.gene.symbols) <- uniprot.to.gene.symbols$uniprot_gn_id
+
+extract.protein.ids <- function(id.list) {
+  unlist(lapply(id.list, function(id.string) {
+  split.id.string <- strsplit(id.string, split = '\\|')[[1]] # Second element of the split by '|' should be the ID string
+  if (length(split.id.string) > 1) {
+    split.id.string[[2]]
+  } else {
+    id.string
+  }
+}))
+}
+
+protein.ids <- extract.protein.ids(loaded.data$Protein)
+
+
+gene.symbols <- unlist(lapply(protein.ids, function(protein.id) {
+  uniprot.to.gene.symbols[protein.id,]$external_gene_name
+}))
+
+gene.symbols <- gene.symbols[!is.na(gene.symbols)]
+
+
+```
+
+```{r}
+# Convert significant.proteins list in ground truth dataset and imputed datasets for GO enrichment analysis
+
+extract.gene.symbols.from.protein.strings <- function(protein.strings) {
+  extracted.protein.ids <- extract.protein.ids(protein.strings)
+  converted.gene.symbols <- unlist(lapply(extracted.protein.ids, function(protein.id) {
+    uniprot.to.gene.symbols[protein.id,]$external_gene_name
+  }))
+  converted.gene.symbols[!is.na(converted.gene.symbols)]
+}
+
+ground.truth.dataset$significant.gene.symbols <- lapply(ground.truth.dataset$significant.proteins, extract.gene.symbols.from.protein.strings)
+
+for (i in 1:length(datasets)) {
+  datasets[[i]]$significant.gene.symbols <- lapply(datasets[[i]]$significant.proteins, extract.gene.symbols.from.protein.strings)
+}
+
+ground.truth.dataset$enrichment.analysis.results <- lapply(ground.truth.dataset$significant.gene.symbols, function(contrast.specific.significant.gene.symbols) {
+  if (length(contrast.specific.significant.gene.symbols) > 0) {
+    enrichment.analysis.using.lists(gene.symbols, contrast.specific.significant.gene.symbols)
+  } else {
+    NULL
+  }
+})
+
+for (i in 1:length(datasets)) {
+  datasets[[i]]$enrichment.analysis.results <- lapply(datasets[[i]]$significant.gene.symbols, function(contrast.specific.significant.gene.symbols) {
+    if (length(contrast.specific.significant.gene.symbols) > 0) {
+      enrichment.analysis.using.lists(gene.symbols, contrast.specific.significant.gene.symbols)
+    } else {
+      NULL
+    }
+  })
+}
+```
+
+```{r}
+calculate.precision <- function(actual.positives, predicted.positives) {
+  number.of.true.positives <- length(intersect(actual.positives, predicted.positives))
+  number.of.predicted.positives <- length(predicted.positives)
+  number.of.true.positives/number.of.predicted.positives
+}
+
+calculate.recall <- function(actual.positives, predicted.positives) {
+  number.of.true.positives <- length(intersect(actual.positives, predicted.positives))
+  number.of.actual.positives <- length(actual.positives)
+  number.of.true.positives/number.of.actual.positives
+}
+
+# GO enrichment precision, recall, true positives, false positives and false negatives
+enrichment.positives.and.negatives <- list()
+for (i in 1:length(datasets)) {
+  enrichment.positives.and.negatives[[i]] <- list()
+  enrichment.positives.and.negatives[[i]]$true.positives <- list()
+  enrichment.positives.and.negatives[[i]]$false.positives <- list()
+  enrichment.positives.and.negatives[[i]]$false.negatives <- list()
+  enrichment.positives.and.negatives[[i]]$ground.truth.positives <- list()
+  for (contrast in ground.truth.de.contrasts) {
+    datasets[[i]]$enrichment.analysis.metrics[[contrast]] <- list()
+    if (is.null(ground.truth.dataset$enrichment.analysis.results[[contrast]])) {
+      datasets[[i]]$enrichment.analysis.metrics[[contrast]]$precision <- NA
+      datasets[[i]]$enrichment.analysis.metrics[[contrast]]$recall <- NA
+      
+      enrichment.positives.and.negatives[[i]]$true.positives[[contrast]] <- NA
+      enrichment.positives.and.negatives[[i]]$false.positives[[contrast]] <- NA
+      enrichment.positives.and.negatives[[i]]$false.negatives[[contrast]] <- NA
+      enrichment.positives.and.negatives[[i]]$ground.truth.positives[[contrast]] <- ground.truth.go.ids
+    } else{
+      ground.truth.go.ids <- ground.truth.dataset$enrichment.analysis.results[[contrast]]$results.table$GO.ID
+      contrast.specific.go.ids <- datasets[[i]]$enrichment.analysis.results[[contrast]]$results.table$GO.ID
+      datasets[[i]]$enrichment.analysis.metrics[[contrast]]$precision <- calculate.precision(ground.truth.go.ids, contrast.specific.go.ids)
+      datasets[[i]]$enrichment.analysis.metrics[[contrast]]$recall <- calculate.recall(ground.truth.go.ids, contrast.specific.go.ids)
+      
+      # The order of metric and contrast are swapped here due to conventions used in the output
+      if (is.null(contrast.specific.go.ids)) {
+        enrichment.positives.and.negatives[[i]]$true.positives[[contrast]] <- NA
+        enrichment.positives.and.negatives[[i]]$false.positives[[contrast]] <- NA
+        enrichment.positives.and.negatives[[i]]$false.negatives[[contrast]] <- ground.truth.go.ids
+        enrichment.positives.and.negatives[[i]]$ground.truth.positives[[contrast]] <- ground.truth.go.ids
+      } else {
+        enrichment.positives.and.negatives[[i]]$true.positives[[contrast]] <- intersect(ground.truth.go.ids, contrast.specific.go.ids)
+        enrichment.positives.and.negatives[[i]]$false.positives[[contrast]] <- setdiff(contrast.specific.go.ids, ground.truth.go.ids)
+        enrichment.positives.and.negatives[[i]]$false.negatives[[contrast]] <- setdiff(ground.truth.go.ids, contrast.specific.go.ids)
+        enrichment.positives.and.negatives[[i]]$ground.truth.positives[[contrast]] <- ground.truth.go.ids
+      }
+    }
+  }
+}
+names(enrichment.positives.and.negatives) <- imputation.technique.names
+```
+
+```{r}
+enrichment.metric.dfs <- list()
+for (metric in c('precision', 'recall')) {
+  for (contrast in ground.truth.de.contrasts) {
+      enrichment.metric.df <- data.frame(technique = character(), metric = double())
+      for (imputation.technique.name in imputation.technique.names) {
+        new.row <- list(technique = imputation.technique.name, metric = datasets[[imputation.technique.name]]$enrichment.analysis.metrics[[contrast]][[metric]])
+
+        enrichment.metric.df <- rbind(enrichment.metric.df, new.row)
+      }
+      enrichment.metric.dfs[[metric]][[contrast]] <- enrichment.metric.df
+  }
+}
+```
+
+```{r}
+for (metric in c('precision', 'recall')) {
+  for (contrast in ground.truth.de.contrasts) {
+    p <- ggplot(data = enrichment.metric.dfs[[metric]][[contrast]], aes(x = technique, y = metric)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label=sprintf('%0.2f', round(metric, digits = 2))), vjust=1.6, color="white", size=3.5) +
+    labs(title = paste(metric, 'for', contrast), x = 'Imputation technique', y = metric) +
+    theme_minimal()
+    print(p)
+  }
+}
+```
+
+```{r}
+# Export statistics for this run
+objects.to.export <- list()
+
+for (imputation.technique.name in imputation.technique.names) {
+  objects.to.export[[imputation.technique.name]] <- list()
+  objects.to.export[[imputation.technique.name]]$rmse <- rmses[[imputation.technique.name]]
+  objects.to.export[[imputation.technique.name]]$de.precisions <- datasets[[imputation.technique.name]]$precisions
+  objects.to.export[[imputation.technique.name]]$de.sensitivities <- datasets[[imputation.technique.name]]$sensitivities
+  objects.to.export[[imputation.technique.name]]$de.specificities <- datasets[[imputation.technique.name]]$specificities
+  
+  objects.to.export[[imputation.technique.name]]$enrichment.precisions <- lapply(ground.truth.de.contrasts, function (contrast) {
+    enrichment.metric.dfs$precision[[contrast]][enrichment.metric.dfs$precision[[contrast]]$technique == imputation.technique.name, 'metric']
+  })
+  names(objects.to.export[[imputation.technique.name]]$enrichment.precisions) <- ground.truth.de.contrasts
+  
+  objects.to.export[[imputation.technique.name]]$enrichment.recalls <- lapply(ground.truth.de.contrasts, function (contrast) {
+    enrichment.metric.dfs$recall[[contrast]][enrichment.metric.dfs$recall[[contrast]]$technique == imputation.technique.name, 'metric']
+  })
+  names(objects.to.export[[imputation.technique.name]]$enrichment.recalls) <- ground.truth.de.contrasts
+  
+  objects.to.export[[imputation.technique.name]]$de.true.positives <- datasets[[imputation.technique.name]]$true.positives
+  objects.to.export[[imputation.technique.name]]$de.false.positives <- datasets[[imputation.technique.name]]$false.positives
+  objects.to.export[[imputation.technique.name]]$de.true.negatives <- datasets[[imputation.technique.name]]$true.negatives
+  objects.to.export[[imputation.technique.name]]$de.false.negatives <- datasets[[imputation.technique.name]]$false.negatives
+  objects.to.export[[imputation.technique.name]]$de.ground.truth.positives <- ground.truth.dataset$significant.proteins
+  objects.to.export[[imputation.technique.name]]$de.ground.truth.negatives <- lapply(ground.truth.dataset$significant.proteins, function(positives.set) {
+    setdiff(loaded.data$protein, positives.set)
+  })
+  
+  objects.to.export[[imputation.technique.name]]$enrichment.true.positives <- enrichment.positives.and.negatives[[imputation.technique.name]]$true.positives
+  objects.to.export[[imputation.technique.name]]$enrichment.false.positives <- enrichment.positives.and.negatives[[imputation.technique.name]]$false.positives
+  objects.to.export[[imputation.technique.name]]$enrichment.false.negatives <- enrichment.positives.and.negatives[[imputation.technique.name]]$false.negatives
+  objects.to.export[[imputation.technique.name]]$enrichment.ground.truth.positives <- enrichment.positives.and.negatives[[imputation.technique.name]]$ground.truth.positives
+}
+
+saveRDS(objects.to.export, file = paste0('imputation_simulation_pipeline_exported_objects_seed_', random.seed, '.RDS'))
+```
+
+```{r}
+# Analyse specific patterns
+data.with.missing.values$Protein <- loaded.data$Protein
+detmin.false.positive.data.with.missing.values <- data.with.missing.values %>% filter(Protein %in% datasets$`deterministic minimal value`$false.positives$`KO.PMCAI.MI-KO.PMCAI.Sham`)
+detmin.false.negative.data.with.missing.values <- data.with.missing.values %>% filter(Protein %in% datasets$`deterministic minimal value`$false.negatives$`KO.PMCAI.MI-KO.PMCAI.Sham`)
+```
+
+```{r}
+# Export results tables for GO enrichment
+for (contrast in ground.truth.de.contrasts) {
+  write.table(ground.truth.dataset$enrichment.analysis.results[[contrast]]$results.table, file = paste0('go_enrichment_results_', contrast, '.txt'), sep = '\t', quote = FALSE, row.names = FALSE)
+}
+```
+
+```{r}
+# Plot imputed vs actual values
+
+imputation.technique.names.formatting.dictionary <- list("zero with median shift" = "Zero",
+                                                         "deterministic minimal value" = "MinDet", 
+                                                         "knn" = "KNN",
+                                                         "random forest" = "Random Forest", 
+                                                         "qrilc" = "QRILC", 
+                                                         "combined" = "Combined (RF + QRILC)")
+
+actual.vs.predicted.plots <- list()
+for (imputation.technique.name in imputation.technique.names) {
+  formatted.technique.name <- imputation.technique.names.formatting.dictionary[[imputation.technique.name]]
+  p <- actual.vs.predicted.single.variable(data.numerical.columns, imputed.datasets[[imputation.technique.name]], simulated.missing.values.mask, data.column.names[[1]], formatted.technique.name)
+  actual.vs.predicted.plots <- append(actual.vs.predicted.plots, list(p))
+}
+for (p in actual.vs.predicted.plots) {
+  print(p)
+}
+
+actual.vs.predicted.figure <- ggarrange(plotlist = actual.vs.predicted.plots, common.legend = TRUE, ncol = 2, nrow = 3)
+annotate_figure(actual.vs.predicted.figure, top = text_grob('Supplementary Figure 1\nActual vs. Predicted Values for KO MI', size = 42))
+ggsave(filename = 'plots/actual.vs.predicted.pdf', width = 33.1, height = 46.8)
+ggsave(filename = 'plots/actual.vs.predicted.svg', width = 33.1, height = 46.8)
+```
+
+```{r}
+contrast.names <- c("KO.PMCAI.MI-KO.PMCAI.Sham", "KO.PMCAI.MI-WT.Sham", "KO.PMCAI.Sham-WT.MI", "WT.MI-WT.Sham")
+number.of.rows <- length(contrast.names)
+ground.truth.results.table <- data.frame(contrast = character(number.of.rows), DE = numeric(number.of.rows), GO = numeric(number.of.rows))
+next.row.index <- 1
+for (contrast.name in contrast.names) {
+  ground.truth.results.table[next.row.index,] <- list(contrast = contrast.name, DE = length(ground.truth.dataset$significant.proteins[[contrast.name]]), GO = length(ground.truth.dataset$enrichment.analysis.results[[contrast.name]]$results.table$GO.ID))
+  next.row.index <- next.row.index + 1
+}
+write.table(ground.truth.results.table, file = 'ground_truth_results_table.txt', sep = '\t', quote = FALSE, row.names = FALSE)
+```

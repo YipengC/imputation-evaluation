@@ -1,0 +1,273 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+```
+
+```{r}
+rds.file.prefix <- 'imputation_simulation_pipeline_exported_objects_seed_'
+rds.file.suffixes <- c('42', '43', '44', '45', '46', '47', '48', '49', '50', '51',
+                       '52', '53', '54', '55', '56', '57', '58', '59', '60', '61',
+                       '62', '63', '64', '65', '66', '67', '68', '69', '70', '71')
+```
+
+```{r}
+exported.objects <- list()
+for (file.suffix in rds.file.suffixes) {
+  exported.objects[[file.suffix]] <- readRDS(paste0(rds.file.prefix, file.suffix, '.RDS'))
+}
+```
+
+```{r}
+# Sham-Sham and MI-MI contrasts have not been included
+contrast.names <- c("KO.PMCAI.MI-KO.PMCAI.Sham", "KO.PMCAI.MI-WT.Sham", "KO.PMCAI.Sham-WT.MI", "WT.MI-WT.Sham")
+# "KO.PMCAI.MI-KO.PMCAI.Sham" "KO.PMCAI.MI-WT.MI"         "KO.PMCAI.MI-WT.Sham"       "KO.PMCAI.Sham-WT.MI"       "KO.PMCAI.Sham-WT.Sham"     "WT.MI-WT.Sham"
+imputation.technique.names <- c("zero with median shift", "deterministic minimal value", "knn", "random forest", "qrilc", "combined")
+
+contrast.names.formatting.dictionary <- list("KO.PMCAI.MI-KO.PMCAI.Sham" = "KO MI - KO Control", 
+                                             "KO.PMCAI.MI-WT.Sham" = "KO MI - WT Control",
+                                             "KO.PMCAI.Sham-WT.MI" = "KO Control - WT MI",
+                                             "WT.MI-WT.Sham" = "WT MI - WT Control")
+
+imputation.technique.names.formatting.dictionary <- list("zero with median shift" = "Zero",
+                                                         "deterministic minimal value" = "MinDet", 
+                                                         "knn" = "KNN",
+                                                         "random forest" = "Random Forest", 
+                                                         "qrilc" = "QRILC", 
+                                                         "combined" = "Combined\n(RF + QRILC)",
+                                                         "Ground Truth" = "Ground Truth")
+```
+
+```{r}
+# rmses. These are processed separately as they are not contrast specific
+rmses <- list()
+for (imputation.technique in imputation.technique.names) {
+  rmses[[imputation.technique]] <- list()
+  rmses[[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+    exported.objects[[x]][[imputation.technique]]$rmse
+  })
+}
+rmses[['Ground Truth']] <- list()
+rmses[['Ground Truth']]$values <- rep.int(0, length(rds.file.suffixes))
+names(rmses[['Ground Truth']]$values) <- rds.file.suffixes
+
+de.true.positives <- list()
+de.false.positives <- list()
+de.false.negatives <- list()
+
+enrichment.true.positives <- list()
+enrichment.false.positives <- list()
+enrichment.false.negatives <- list()
+
+de.dfs <- list()
+enrichment.dfs <- list()
+
+for (contrast in contrast.names) {
+  for (imputation.technique in imputation.technique.names) {
+    de.true.positives[[contrast]][[imputation.technique]] <- list()
+    de.true.positives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$de.true.positives[[contrast]])
+    })
+    na.value.indexes <- is.na(de.true.positives[[contrast]][[imputation.technique]]$values)
+    de.true.positives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+    
+    
+    de.false.positives[[contrast]][[imputation.technique]] <- list()
+    de.false.positives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$de.false.positives[[contrast]])
+    })
+    na.value.indexes <- is.na(de.false.positives[[contrast]][[imputation.technique]]$values)
+    de.false.positives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+    
+    
+    de.false.negatives[[contrast]][[imputation.technique]] <- list()
+    de.false.negatives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$de.false.negatives[[contrast]])
+    })
+    na.value.indexes <- is.na(de.false.negatives[[contrast]][[imputation.technique]]$values)
+    de.false.negatives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+
+    enrichment.true.positives[[contrast]][[imputation.technique]] <- list()
+    enrichment.true.positives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$enrichment.true.positives[[contrast]])
+    })
+    na.value.indexes <- is.na(enrichment.true.positives[[contrast]][[imputation.technique]]$values)
+    enrichment.true.positives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+    
+    enrichment.false.positives[[contrast]][[imputation.technique]] <- list()
+    enrichment.false.positives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$enrichment.false.positives[[contrast]])
+    })
+    na.value.indexes <- is.na(enrichment.false.positives[[contrast]][[imputation.technique]]$values)
+    enrichment.false.positives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+    
+    enrichment.false.negatives[[contrast]][[imputation.technique]] <- list()
+    enrichment.false.negatives[[contrast]][[imputation.technique]]$values <- sapply(rds.file.suffixes, function(x) {
+      length(exported.objects[[x]][[imputation.technique]]$enrichment.false.negatives[[contrast]])
+    })
+    na.value.indexes <- is.na(enrichment.false.negatives[[contrast]][[imputation.technique]]$values)
+    enrichment.false.negatives[[contrast]][[imputation.technique]]$values[na.value.indexes] <- 0
+  }
+  
+  
+  
+  # Add ground truth
+  de.true.positives[[contrast]][['Ground Truth']] <- list()
+  de.true.positives[[contrast]][['Ground Truth']]$values <- sapply(rds.file.suffixes, function(x) {
+    length(exported.objects[[x]][[1]]$de.ground.truth.positives[[contrast]])
+  })
+  na.value.indexes <- is.na(de.true.positives[[contrast]][['Ground Truth']]$values)
+  de.true.positives[[contrast]][['Ground Truth']]$values[na.value.indexes] <- 0
+  
+  de.false.positives[[contrast]][['Ground Truth']] <- list()
+  de.false.positives[[contrast]][['Ground Truth']]$values <- rep.int(0, length(rds.file.suffixes))
+  names(de.false.positives[[contrast]][['Ground Truth']]$values) <- rds.file.suffixes
+  
+  de.false.negatives[[contrast]][['Ground Truth']] <- list()
+  de.false.negatives[[contrast]][['Ground Truth']]$values <- rep.int(0, length(rds.file.suffixes))
+  names(de.false.negatives[[contrast]][['Ground Truth']]$values) <- rds.file.suffixes
+
+  
+  enrichment.true.positives[[contrast]][['Ground Truth']] <- list()
+  enrichment.true.positives[[contrast]][['Ground Truth']]$values <- sapply(rds.file.suffixes, function(x) {
+    length(exported.objects[[x]][[1]]$enrichment.ground.truth.positives[[contrast]])
+  })
+  na.value.indexes <- is.na(enrichment.true.positives[[contrast]][['Ground Truth']]$values)
+  enrichment.true.positives[[contrast]][['Ground Truth']]$values[na.value.indexes] <- 0
+
+  
+  enrichment.false.positives[[contrast]][['Ground Truth']] <- list()
+  enrichment.false.positives[[contrast]][['Ground Truth']]$values <- rep.int(0, length(rds.file.suffixes))
+  names(enrichment.false.positives[[contrast]][['Ground Truth']]$values) <- rds.file.suffixes
+
+  
+  enrichment.false.negatives[[contrast]][['Ground Truth']] <- list()
+  enrichment.false.negatives[[contrast]][['Ground Truth']]$values <- rep.int(0, length(rds.file.suffixes))
+  names(enrichment.false.negatives[[contrast]][['Ground Truth']]$values) <- rds.file.suffixes
+
+
+  imputation.technique.names <- c(imputation.technique.names, 'Ground Truth')
+  
+  de.df <- data.frame()
+  enrichment.df <- data.frame()
+  for (imputation.technique in imputation.technique.names) {
+    de.tp.values <- de.true.positives[[contrast]][[imputation.technique]]$values
+    de.tp.df <- data.frame('metric' = 'True Positives', 'technique' = imputation.technique, 'value' = de.tp.values)
+    de.fp.values <- de.false.positives[[contrast]][[imputation.technique]]$values
+    de.fp.df <- data.frame('metric' = 'False Positives', 'technique' = imputation.technique, 'value' = de.fp.values)
+    de.fn.values <- de.false.negatives[[contrast]][[imputation.technique]]$values
+    de.fn.df <- data.frame('metric' = 'False Negatives', 'technique' = imputation.technique, 'value' = de.fn.values)
+    
+    de.df <- rbind(de.df, de.tp.df, de.fp.df, de.fn.df)
+    
+    enrichment.tp.values <- enrichment.true.positives[[contrast]][[imputation.technique]]$values
+    enrichment.tp.df <- data.frame('metric' = 'True Positives', 'technique' = imputation.technique, 'value' = enrichment.tp.values)
+    enrichment.fp.values <- enrichment.false.positives[[contrast]][[imputation.technique]]$values
+    enrichment.fp.df <- data.frame('metric' = 'False Positives', 'technique' = imputation.technique, 'value' = enrichment.fp.values)
+    enrichment.fn.values <- enrichment.false.negatives[[contrast]][[imputation.technique]]$values
+    enrichment.fn.df <- data.frame('metric' = 'False Negatives', 'technique' = imputation.technique, 'value' = enrichment.fn.values)
+    
+    enrichment.df <- rbind(enrichment.df, enrichment.tp.df, enrichment.fp.df, enrichment.fn.df)
+  }
+  de.dfs[[contrast]] <- de.df
+  enrichment.dfs[[contrast]] <- enrichment.df
+}
+
+rmses.df <- data.frame()
+for (imputation.technique in imputation.technique.names) {
+  df <- data.frame('technique' = imputation.technique, 'value' = rmses[[imputation.technique]]$values)
+  rmses.df <- rbind(rmses.df, df)
+}
+
+```
+
+```{r}
+# Format names of imputation techniques
+ordered.imputation.technique.levels <- c('Zero', 'MinDet', 'QRILC', 'Combined\n(RF + QRILC)', 'KNN', 'Random Forest', 'Ground Truth')
+
+for (contrast in contrast.names) {
+  de.dfs[[contrast]]$technique <- sapply(de.dfs[[contrast]]$technique, function(technique.name) {
+    imputation.technique.names.formatting.dictionary[[technique.name]]
+  })
+  
+  de.dfs[[contrast]]$technique <- factor(de.dfs[[contrast]]$technique, levels = ordered.imputation.technique.levels)
+  
+  enrichment.dfs[[contrast]]$technique <- sapply(enrichment.dfs[[contrast]]$technique, function(technique.name) {
+    imputation.technique.names.formatting.dictionary[[technique.name]]
+  })
+  
+  enrichment.dfs[[contrast]]$technique <- factor(enrichment.dfs[[contrast]]$technique, levels = ordered.imputation.technique.levels)
+}
+rmses.df$technique <- sapply(rmses.df$technique, function(technique.name) {
+  imputation.technique.names.formatting.dictionary[[technique.name]]
+})
+rmses.df$technique <- factor(rmses.df$technique, levels = ordered.imputation.technique.levels)
+```
+
+```{r}
+# Colour-blind friendly palette
+cbPalette <- c(# "#999999", 
+               "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+# Stripcharts
+create.stripchart <- function(df, title) {
+  p <- ggplot(df, aes(x = technique, y = value, color = metric)) +
+    scale_colour_manual(values = cbPalette) +
+    # geom_boxplot(outlier.shape = NA, size = 0.2, position = position_dodge(0.75), key_glyph = 'point') +
+    geom_jitter(position = position_jitterdodge(jitter.width = 0.5), size = 4, alpha = 0.7) + 
+    stat_summary_bin(aes(x = technique, y = value, group = metric), geom = 'crossbar', fun = 'median', size = 0.2, position = position_dodge(0.75), color = '#555555') +
+    theme_classic(base_size = 32) +
+    ggtitle(title) +
+    theme(axis.text.x = element_text(angle = 90),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 40),
+          legend.title = element_blank(),
+          legend.position = 'top') +
+    guides(color = guide_legend(override.aes = list(size = 6)))
+  p
+}
+
+de.plots <- lapply(contrast.names, function(contrast) {create.stripchart(de.dfs[[contrast]],
+                                                                         title = 'A) Differential Expression')})
+names(de.plots) <- contrast.names
+enrichment.plots <- lapply(contrast.names, function(contrast) {create.stripchart(enrichment.dfs[[contrast]],
+                                                                                 title = 'B) Enrichment Analysis')})
+names(enrichment.plots) <- contrast.names
+
+create.non.grouped.stripchart <- function(df, title) {
+  p <- ggplot(df, aes(x = technique, y = value)) +
+    scale_colour_manual(values = cbPalette) +
+    # geom_boxplot(outlier.shape = NA, size = 0.2) +
+    geom_jitter(size = 4, position = position_jitter(0.4), alpha = 0.7) +
+    stat_summary(fun = 'median', geom = 'crossbar', size = 0.2, color = '#555555') +
+    theme_classic(base_size = 32) +
+    ggtitle(title) +
+    theme(plot.title = element_text(size = 40),
+          axis.title.y = element_blank(),
+          axis.text.x = element_text(angle = 90),
+          axis.title.x = element_blank())
+  p
+}
+rmses.plot <- create.non.grouped.stripchart(rmses.df,
+                                            title = 'C) RMSE')
+```
+
+```{r}
+# Combine plots and output
+combined.plots <- lapply(contrast.names, function(contrast) {
+  # figure panel 
+ggarrange(de.plots[[contrast]], enrichment.plots[[contrast]], rmses.plot, common.legend = TRUE, legend = 'right', ncol = 1, nrow = 3, align = 'v')
+})
+names(combined.plots) <- contrast.names
+
+for (contrast in contrast.names) {
+  ggsave(filename = paste0('plots/', contrast, '_stripchart_panel.pdf'), plot = combined.plots[[contrast]], width = 36, height = 54, units = 'cm')
+  ggsave(filename = paste0('plots/', contrast, '_stripchart_panel.svg'), plot = combined.plots[[contrast]], width = 36, height = 54, units = 'cm')
+  ggsave(filename = paste0('plots/', contrast, '_stripchart_panel.png'), plot = combined.plots[[contrast]], width = 36, height = 54, units = 'cm')
+}
+```
